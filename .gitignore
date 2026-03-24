@@ -1,0 +1,42 @@
+# Byte-code files
+__pycache__
+*.pyc
+
+# Virtual environment
+.venv
+env/
+venv/
+# If you are using pipenv, you might want to include Pipfile.lock and
+# poetry.lock in version control, as they are recommended.
+# If not, you can add them here:
+# Pipfile.lock
+# poetry.lock
+
+# Editor directories and files
+.idea/  # For PyCharm/IntelliJ
+.vscode/ # For VS Code (optional, as some config might be useful to share)
+*.swp
+
+# Environment variables
+.env
+.flaskenv
+
+# Database files
+*.sqlite
+*.db
+/test_db.db # specific database file example
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# FastAPI Cloud deployment
+# Ignore files only during deployment to FastAPI Cloud, if applicable.
+# You can use a separate .fastapicloudignore file for this purpose.
+
+# Misc
+dist/
+build/
+*.egg-info/
+
+.vscode/
