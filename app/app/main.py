@@ -1,7 +1,6 @@
 from contextlib import asynccontextmanager
 
-import asyncio
-from fastapi import FastAPI, Depends
+from fastapi import Body, FastAPI, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import models, schemas, crud, database, rabbit
@@ -36,9 +35,20 @@ async def create_product(
 ):
     db_product = await crud.create_product(db, product)
     await rabbit.RabbitMq.publish_price_update(
-        f"Обновленная цена товара {db_product.id}: {db_product.price}"
+        {
+            "event": "product.created",
+            "product_id": db_product.id,
+            "price": db_product.price,
+            "message": f"Обновленная цена товара {db_product.id}: {db_product.price}",
+            "force_fail": False,
+        }
     )
     return db_product
+
+@app.post("/debug/publish_fail/")
+async def publish_fail(payload: dict = Body(default={"force_fail": True})):
+    await rabbit.RabbitMq.publish_price_update(payload)
+    return {"ok": True}
 
 
 @app.get("/products/", response_model=list[schemas.ProductRead])

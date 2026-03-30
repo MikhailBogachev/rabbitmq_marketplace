@@ -1,35 +1,33 @@
 import asyncio
+import json
 import logging
 
-import aio_pika
-
+from .rabbit import RabbitMq, QUEUE_NAME
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("price-consumer")
 
 
-RABBITMQ_URL = "amqp://user:password@rabbitmq:5672/"
-QUEUE_NAME = "price_updates"
-
-
 async def main() -> None:
-    connection = await aio_pika.connect_robust(RABBITMQ_URL)
-    channel = await connection.channel()
+    await RabbitMq.connect()
+    assert RabbitMq.queue is not None
 
-    await channel.set_qos(prefetch_count=10)
-
-    queue = await channel.declare_queue(QUEUE_NAME, durable=True)
-
-    logger.info("Waiting for messages...")
+    queue = RabbitMq.queue
+    logger.info("Consuming from queue: %s", QUEUE_NAME)
 
     async with queue.iterator() as q:
         async for message in q:
             try:
-                async with message.process(requeue=False):
-                    body = message.body.decode()
-                    logger.info("Got message: %s", body)
+                payload = json.loads(message.body.decode("utf-8"))
+                logger.info("Got message: %s", payload)
+
+                if payload.get("force_fail"):
+                    raise RuntimeError("Forced fail for DLQ test")
+
+                await message.ack()
             except Exception:
-                logger.exception("Failde to process message")
+                logger.exception("Processing failed -> reject requeue=false (DLQ)")
+                await message.reject(requeue=False)
 
 
 if __name__ == "__main__":
