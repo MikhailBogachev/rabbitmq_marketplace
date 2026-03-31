@@ -10,17 +10,28 @@ from aio_pika import ExchangeType, Message
 
 RABBITMQ_URL = "amqp://user:password@rabbitmq:5672/"
 
+
 # Producer topology
 EXCHANGE_NAME = "price_exchange"
 ROUTING_KEY = "price.update"
 
+
 # Main queue (consumer reads from it)
 QUEUE_NAME = "price_updates"
+
 
 # DLQ / DLX
 DLX_NAME = "price_dlx"
 DLQ_NAME = "price_updates.dlq"
 DLQ_ROUTING_KEY = "price.update.dlq"
+
+
+# Retry
+RETRY_EXCHANGE_NAME = "price_retry_exchange"
+RETRY_5S_QUEUE = "price_updates.retry.5s"
+RETRY_30S_QUEUE = "price_updates.retry.30s"
+RETRY_5S_KEY = "price.update.retry.5s"
+RETRY_30S_KEY = "price.update.retry.30s"
 
 
 class RabbitMq:
@@ -29,6 +40,7 @@ class RabbitMq:
 
     exchange: Optional[aio_pika.RobustExchange] = None
     dlx: Optional[aio_pika.RobustExchange] = None
+    retry_exchange: Optional[aio_pika.RobustExchange] = None
 
     queue: Optional[aio_pika.RobustQueue] = None
 
@@ -49,28 +61,33 @@ class RabbitMq:
         cls.channel = await cls.connection.channel()
         await cls.channel.set_qos(prefetch_count=10)
 
-        # 1) Main exchange (producer publishes here)
+        # Main exchange (producer publishes here)
         cls.exchange = await cls.channel.declare_exchange(
             EXCHANGE_NAME,
             ExchangeType.DIRECT,
             durable=True,
         )
 
-        # 2) Dead-letter exchange
+        # Dead-letter exchange
         cls.dlx = await cls.channel.declare_exchange(
             DLX_NAME,
             ExchangeType.DIRECT,
             durable=True,
         )
 
-        # 3) Dead-letter queue (where rejected messages go)
+        # Retry exchange
+        cls.retry_exchange = await cls.channel.declare_exchange(
+            RETRY_EXCHANGE_NAME, ExchangeType.DIRECT, durable=True
+        )
+
+        # Dead-letter queue (where rejected messages go)
         dlq = await cls.channel.declare_queue(
             DLQ_NAME,
             durable=True,
         )
         await dlq.bind(cls.dlx, routing_key=DLQ_ROUTING_KEY)
 
-        # 4) Main queue with DLQ settings
+        # Main queue with DLQ settings
         cls.queue = await cls.channel.declare_queue(
             QUEUE_NAME,
             durable=True,
@@ -79,9 +96,30 @@ class RabbitMq:
                 "x-dead-letter-routing-key": DLQ_ROUTING_KEY,
             },
         )
-
-        # 5) Bind main queue to main exchange
         await cls.queue.bind(cls.exchange, routing_key=ROUTING_KEY)
+
+        retry_5s = await cls.channel.declare_queue(
+            RETRY_5S_QUEUE,
+            durable=True,
+            arguments={
+                "x-message-ttl": 5_000,
+                "x-dead-letter-exchange": DLX_NAME,
+                "x-dead-letter-routing-key": DLQ_ROUTING_KEY,
+            }
+        )
+        await cls.queue.bind(cls.retry_exchange, routing_key=RETRY_5S_KEY)
+
+        retry_30s = await cls.channel.declare_queue(
+            RETRY_30S_QUEUE,
+            durable=True,
+            arguments={
+                "x-message-ttl": 5_000,
+                "x-dead-letter-exchange": DLX_NAME,
+                "x-dead-letter-routing-key": DLQ_ROUTING_KEY,
+            }
+        )
+        await cls.queue.bind(cls.retry_exchange, routing_key=RETRY_30S_KEY)
+
 
     @classmethod
     async def close(cls) -> None:
@@ -93,6 +131,7 @@ class RabbitMq:
         cls.exchange = None
         cls.dlx = None
         cls.queue = None
+
 
     @classmethod
     async def publish_price_update(cls, payload: dict[str, Any]) -> None:
@@ -111,6 +150,31 @@ class RabbitMq:
 
         assert cls.exchange is not None
         await cls.exchange.publish(msg, routing_key=ROUTING_KEY)
+
+
+    @classmethod
+    async def publish_retry(cls, payload: dict[str, Any], retry_key: str,
+        headers: Optional[dict[str, Any]] = None,) -> None:
+        """
+        Publish message into retry exchange.
+        retry_key should be one of:
+        - price.update.retry.5s
+        - price.update.retry.30s
+        """
+        if cls.retry_exchange is None:
+            cls.connect()
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        msg = Message(
+            body=body,
+            content_type="application/json",
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            headers=headers or {},
+        )
+
+        assert cls.retry_exchange is not None
+        await cls.retry_exchange.publish(msg, routing_key=retry_key)
+
 
     @classmethod
     async def dev_delete_queues(cls) -> None:
