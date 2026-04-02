@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Optional
 
 import aio_pika
 import aiormq
 from aio_pika import ExchangeType, Message
+from aio_pika.exceptions import DeliveryError
 
 
 RABBITMQ_URL = "amqp://user:password@rabbitmq:5672/"
@@ -33,6 +35,10 @@ RETRY_30S_QUEUE = "price_updates.retry.30s"
 RETRY_5S_KEY = "price.update.retry.5s"
 RETRY_30S_KEY = "price.update.retry.30s"
 
+# Unroutable
+UNROUTABLE_EXCHANGE = "price_unroutable_exchange"
+UNROUTABLE_QUEUE = "price_unroutable"
+
 
 class RabbitMq:
     connection: Optional[aio_pika.RobustConnection] = None
@@ -58,14 +64,26 @@ class RabbitMq:
             return
 
         cls.connection = await aio_pika.connect_robust(RABBITMQ_URL)
-        cls.channel = await cls.connection.channel()
+        cls.channel = await cls.connection.channel(publisher_confirms=True)
         await cls.channel.set_qos(prefetch_count=10)
+
+        unroutable_exchange = await cls.channel.declare_exchange(
+            UNROUTABLE_EXCHANGE,
+            ExchangeType.FANOUT,
+            durable=True,
+        )
+        unroutable_queue = await cls.channel.declare_queue(
+            UNROUTABLE_QUEUE,
+            durable=True,
+        )
+        await unroutable_queue.bind(unroutable_exchange)
 
         # Main exchange (producer publishes here)
         cls.exchange = await cls.channel.declare_exchange(
             EXCHANGE_NAME,
             ExchangeType.DIRECT,
             durable=True,
+            arguments={"alternate-exchange": UNROUTABLE_EXCHANGE}
         )
 
         # Dead-letter exchange
@@ -134,45 +152,54 @@ class RabbitMq:
 
 
     @classmethod
-    async def publish_price_update(cls, payload: dict[str, Any]) -> None:
-        """
-        Publishes JSON message to EXCHANGE_NAME with ROUTING_KEY.
-        """
-        if cls.exchange is None:
-            await cls.connect()
-
+    def _make_message(
+        cls,
+        payload: dict[str, Any],
+        headers: Optional[dict[str, Any]] = None,
+    ) -> Message:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        msg = Message(
-            body=body,
-            content_type="application/json",
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-        )
-
-        assert cls.exchange is not None
-        await cls.exchange.publish(msg, routing_key=ROUTING_KEY)
-
-
-    @classmethod
-    async def publish_retry(cls, payload: dict[str, Any], retry_key: str,
-        headers: Optional[dict[str, Any]] = None,) -> None:
-        """
-        Publish message into retry exchange.
-        retry_key should be one of:
-        - price.update.retry.5s
-        - price.update.retry.30s
-        """
-        if cls.retry_exchange is None:
-            cls.connect()
-
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        msg = Message(
+        return Message(
             body=body,
             content_type="application/json",
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             headers=headers or {},
         )
 
+
+    @classmethod
+    async def publish_price_update(
+        cls,
+        payload: dict[str, Any],
+        headers: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """
+        Publishes JSON message to EXCHANGE_NAME with ROUTING_KEY.
+        """
+        if cls.exchange is None:
+            await cls.connect()
+        assert cls.exchange is not None
+
+        msg = cls._make_message(payload, headers=headers)
+        await cls.exchange.publish(msg, routing_key=ROUTING_KEY)
+
+
+    @classmethod
+    async def publish_retry(
+        cls,
+        payload: dict[str, Any],
+        retry_key: str,
+        headers: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """
+        Publish message into retry exchange with routing key:
+        - price.update.retry.5s
+        - price.update.retry.30s
+        """
+        if cls.retry_exchange is None:
+            await cls.connect()
         assert cls.retry_exchange is not None
+
+        msg = cls._make_message(payload, headers=headers)
         await cls.retry_exchange.publish(msg, routing_key=retry_key)
 
 

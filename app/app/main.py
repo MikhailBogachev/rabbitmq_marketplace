@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
+import json
 
+from aio_pika import Message
 from fastapi import Body, FastAPI, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,3 +56,14 @@ async def publish_fail(payload: dict = Body(default={"force_fail": True})):
 @app.get("/products/", response_model=list[schemas.ProductRead])
 async def list_products(db: AsyncSession = Depends(database.get_session)):
     return await crud.get_products(db)
+
+
+@app.post("/debug/publish_unroutable/")
+async def publish_unroutable():
+    payload = {"event": "test.unroutable"}
+    body = json.dumps(payload).encode("utf-8")
+    msg = Message(body=body, content_type="application/json")
+
+    # Публикуем напрямую в exchange с неправильным ключом
+    await rabbit.RabbitMq.exchange.publish(msg, routing_key="price.update.WRONG")
+    return {"ok": True}
