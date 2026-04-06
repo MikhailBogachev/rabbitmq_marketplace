@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any, Optional
 
 import aio_pika
@@ -39,6 +40,9 @@ RETRY_30S_KEY = "price.update.retry.30s"
 UNROUTABLE_EXCHANGE = "price_unroutable_exchange"
 UNROUTABLE_QUEUE = "price_unroutable"
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("rabbit")
+
 
 class RabbitMq:
     connection: Optional[aio_pika.RobustConnection] = None
@@ -67,11 +71,14 @@ class RabbitMq:
         cls.channel = await cls.connection.channel(publisher_confirms=True)
         await cls.channel.set_qos(prefetch_count=10)
 
+        # Unroutable exchange
         unroutable_exchange = await cls.channel.declare_exchange(
             UNROUTABLE_EXCHANGE,
             ExchangeType.FANOUT,
             durable=True,
         )
+
+        # Unroutable queue
         unroutable_queue = await cls.channel.declare_queue(
             UNROUTABLE_QUEUE,
             durable=True,
@@ -86,25 +93,6 @@ class RabbitMq:
             arguments={"alternate-exchange": UNROUTABLE_EXCHANGE}
         )
 
-        # Dead-letter exchange
-        cls.dlx = await cls.channel.declare_exchange(
-            DLX_NAME,
-            ExchangeType.DIRECT,
-            durable=True,
-        )
-
-        # Retry exchange
-        cls.retry_exchange = await cls.channel.declare_exchange(
-            RETRY_EXCHANGE_NAME, ExchangeType.DIRECT, durable=True
-        )
-
-        # Dead-letter queue (where rejected messages go)
-        dlq = await cls.channel.declare_queue(
-            DLQ_NAME,
-            durable=True,
-        )
-        await dlq.bind(cls.dlx, routing_key=DLQ_ROUTING_KEY)
-
         # Main queue with DLQ settings
         cls.queue = await cls.channel.declare_queue(
             QUEUE_NAME,
@@ -116,27 +104,47 @@ class RabbitMq:
         )
         await cls.queue.bind(cls.exchange, routing_key=ROUTING_KEY)
 
+        # Dead-letter exchange
+        cls.dlx = await cls.channel.declare_exchange(
+            DLX_NAME,
+            ExchangeType.DIRECT,
+            durable=True,
+        )
+
+        # Dead-letter queue (where rejected messages go)
+        dlq = await cls.channel.declare_queue(
+            DLQ_NAME,
+            durable=True,
+        )
+        await dlq.bind(cls.dlx, routing_key=DLQ_ROUTING_KEY)
+
+        # Retry exchange
+        cls.retry_exchange = await cls.channel.declare_exchange(
+            RETRY_EXCHANGE_NAME, ExchangeType.DIRECT, durable=True
+        )
+
+        # Retry queues
         retry_5s = await cls.channel.declare_queue(
             RETRY_5S_QUEUE,
             durable=True,
             arguments={
                 "x-message-ttl": 5_000,
-                "x-dead-letter-exchange": DLX_NAME,
-                "x-dead-letter-routing-key": DLQ_ROUTING_KEY,
+                "x-dead-letter-exchange": EXCHANGE_NAME,
+                "x-dead-letter-routing-key": ROUTING_KEY,
             }
         )
-        await cls.queue.bind(cls.retry_exchange, routing_key=RETRY_5S_KEY)
+        await retry_5s.bind(cls.retry_exchange, routing_key=RETRY_5S_KEY)
 
         retry_30s = await cls.channel.declare_queue(
             RETRY_30S_QUEUE,
             durable=True,
             arguments={
-                "x-message-ttl": 5_000,
-                "x-dead-letter-exchange": DLX_NAME,
-                "x-dead-letter-routing-key": DLQ_ROUTING_KEY,
+                "x-message-ttl": 30_000,
+                "x-dead-letter-exchange": EXCHANGE_NAME,
+                "x-dead-letter-routing-key": ROUTING_KEY,
             }
         )
-        await cls.queue.bind(cls.retry_exchange, routing_key=RETRY_30S_KEY)
+        await retry_30s.bind(cls.retry_exchange, routing_key=RETRY_30S_KEY)
 
 
     @classmethod
