@@ -40,3 +40,8 @@ build/
 *.egg-info/
 
 .vscode/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
