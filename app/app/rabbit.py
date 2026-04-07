@@ -1,44 +1,38 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from typing import Any, Optional
 
 import aio_pika
-import aiormq
 from aio_pika import ExchangeType, Message
-from aio_pika.exceptions import DeliveryError
+
+from .events import EventEnvelope
 
 
 RABBITMQ_URL = "amqp://user:password@rabbitmq:5672/"
 
 
-# Producer topology
-EXCHANGE_NAME = "price_exchange"
-ROUTING_KEY = "price.update"
-
-
-# Main queue (consumer reads from it)
-QUEUE_NAME = "price_updates"
-
-
-# DLQ / DLX
-DLX_NAME = "price_dlx"
-DLQ_NAME = "price_updates.dlq"
-DLQ_ROUTING_KEY = "price.update.dlq"
-
-
-# Retry
-RETRY_EXCHANGE_NAME = "price_retry_exchange"
-RETRY_5S_QUEUE = "price_updates.retry.5s"
-RETRY_30S_QUEUE = "price_updates.retry.30s"
-RETRY_5S_KEY = "price.update.retry.5s"
-RETRY_30S_KEY = "price.update.retry.30s"
+# Nain events bus
+EVENTS_EXCHANGE = "events"
 
 # Unroutable
-UNROUTABLE_EXCHANGE = "price_unroutable_exchange"
-UNROUTABLE_QUEUE = "price_unroutable"
+UNROUTABLE_EXCHANGE = "events_unroutable_exchange"
+UNROUTABLE_QUEUE = "events_unroutable"
+
+# DLQ / DLX
+DLX_NAME = "events_dlx"
+DLQ_ROUTING_KEY = "deadletter"
+
+# Retry
+RETRY_EXCHANGE_NAME = "events_retry_exchange"
+RETRY_5S_QUEUE = "events.retry.5s"
+RETRY_30S_QUEUE = "events.retry.30s"
+RETRY_5S_KEY = "retry.5s"
+RETRY_30S_KEY = "retry.30s"
+
+PRODUCER_NAME = "catalog-service"
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rabbit")
@@ -48,11 +42,9 @@ class RabbitMq:
     connection: Optional[aio_pika.RobustConnection] = None
     channel: Optional[aio_pika.RobustChannel] = None
 
-    exchange: Optional[aio_pika.RobustExchange] = None
+    events_exchange: Optional[aio_pika.RobustExchange] = None
     dlx: Optional[aio_pika.RobustExchange] = None
     retry_exchange: Optional[aio_pika.RobustExchange] = None
-
-    queue: Optional[aio_pika.RobustQueue] = None
 
     @classmethod
     async def connect(cls) -> None:
@@ -85,24 +77,13 @@ class RabbitMq:
         )
         await unroutable_queue.bind(unroutable_exchange)
 
-        # Main exchange (producer publishes here)
-        cls.exchange = await cls.channel.declare_exchange(
-            EXCHANGE_NAME,
-            ExchangeType.DIRECT,
+        # Event exchange topic + alterante echange
+        cls.events_exchange = await cls.channel.declare_exchange(
+            EVENTS_EXCHANGE,
+            ExchangeType.TOPIC,
             durable=True,
             arguments={"alternate-exchange": UNROUTABLE_EXCHANGE}
         )
-
-        # Main queue with DLQ settings
-        cls.queue = await cls.channel.declare_queue(
-            QUEUE_NAME,
-            durable=True,
-            arguments={
-                "x-dead-letter-exchange": DLX_NAME,
-                "x-dead-letter-routing-key": DLQ_ROUTING_KEY,
-            },
-        )
-        await cls.queue.bind(cls.exchange, routing_key=ROUTING_KEY)
 
         # Dead-letter exchange
         cls.dlx = await cls.channel.declare_exchange(
@@ -110,13 +91,6 @@ class RabbitMq:
             ExchangeType.DIRECT,
             durable=True,
         )
-
-        # Dead-letter queue (where rejected messages go)
-        dlq = await cls.channel.declare_queue(
-            DLQ_NAME,
-            durable=True,
-        )
-        await dlq.bind(cls.dlx, routing_key=DLQ_ROUTING_KEY)
 
         # Retry exchange
         cls.retry_exchange = await cls.channel.declare_exchange(
@@ -129,8 +103,7 @@ class RabbitMq:
             durable=True,
             arguments={
                 "x-message-ttl": 5_000,
-                "x-dead-letter-exchange": EXCHANGE_NAME,
-                "x-dead-letter-routing-key": ROUTING_KEY,
+                "x-dead-letter-exchange": EVENTS_EXCHANGE,
             }
         )
         await retry_5s.bind(cls.retry_exchange, routing_key=RETRY_5S_KEY)
@@ -140,8 +113,7 @@ class RabbitMq:
             durable=True,
             arguments={
                 "x-message-ttl": 30_000,
-                "x-dead-letter-exchange": EXCHANGE_NAME,
-                "x-dead-letter-routing-key": ROUTING_KEY,
+                "x-dead-letter-exchange": EVENTS_EXCHANGE,
             }
         )
         await retry_30s.bind(cls.retry_exchange, routing_key=RETRY_30S_KEY)
@@ -154,9 +126,9 @@ class RabbitMq:
 
         cls.connection = None
         cls.channel = None
-        cls.exchange = None
+        cls.events_exchange = None
         cls.dlx = None
-        cls.queue = None
+        cls.retry_exchange = None
 
 
     @classmethod
@@ -175,56 +147,55 @@ class RabbitMq:
 
 
     @classmethod
-    async def publish_price_update(
+    async def publish_event(
         cls,
-        payload: dict[str, Any],
+        routing_key: str,
+        data: dict[str, Any],
         headers: Optional[dict[str, Any]] = None,
     ) -> None:
         """
-        Publishes JSON message to EXCHANGE_NAME with ROUTING_KEY.
+        Publish domain event to topic exchange with routing_key like:
+        - product.created
+        - product.updated
+        - price.updated
         """
-        if cls.exchange is None:
+        if cls.events_exchange is None:
             await cls.connect()
-        assert cls.exchange is not None
+        assert cls.events_exchange is not None
 
-        msg = cls._make_message(payload, headers=headers)
-        await cls.exchange.publish(msg, routing_key=ROUTING_KEY)
+        envelope = EventEnvelope(
+            event_type=routing_key,
+            producer = PRODUCER_NAME,
+            data=data
+        )
+
+        msg = cls._make_message(envelope.model_dump(mode="json"), headers=headers)
+        await cls.events_exchange.publish(msg, routing_key=routing_key)
+        return envelope
 
 
     @classmethod
     async def publish_retry(
         cls,
-        payload: dict[str, Any],
         retry_key: str,
+        original_routing_key: str,
+        payload: dict[str, Any],
         headers: Optional[dict[str, Any]] = None,
     ) -> None:
         """
-        Publish message into retry exchange with routing key:
-        - price.update.retry.5s
-        - price.update.retry.30s
+        Retry publish:
+        - message goes to retry queue by retry_key (retry.5s / retry.30s)
+        - after TTL it dead-letters back to EVENTS_EXCHANGE
+        - IMPORTANT: we must preserve original routing key.
+          RabbitMQ DLX supports per-message routing key via header 'x-death' is read-only,
+          so we store it ourselves and consumer will re-publish correctly if needed.
         """
         if cls.retry_exchange is None:
             await cls.connect()
         assert cls.retry_exchange is not None
 
-        msg = cls._make_message(payload, headers=headers)
+        new_headers = dict(headers or {})
+        new_headers["x-original-routing-key"] = original_routing_key
+
+        msg = cls._make_message(payload, headers=new_headers)
         await cls.retry_exchange.publish(msg, routing_key=retry_key)
-
-
-    @classmethod
-    async def dev_delete_queues(cls) -> None:
-        """
-        Optional helper for development:
-        deletes main queue + DLQ.
-        Use with extreme caution. In real systems you don't do this automatically.
-        """
-        if cls.channel is None:
-            await cls.connect()
-        assert cls.channel is not None
-
-        for qname in (QUEUE_NAME, DLQ_NAME):
-            q = aio_pika.Queue(cls.channel, qname)
-            try:
-                await q.delete(if_unused=False, if_empty=False)
-            except aiormq.exceptions.ChannelNotFoundEntity:
-                pass

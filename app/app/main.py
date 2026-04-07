@@ -36,14 +36,20 @@ async def create_product(
     db: AsyncSession = Depends(database.get_session)
 ):
     db_product = await crud.create_product(db, product)
-    await rabbit.RabbitMq.publish_price_update(
-        {
-            "event": "product.created",
+    await rabbit.RabbitMq.publish_event(
+        routing_key="product.created",
+        data={
             "product_id": db_product.id,
+            "name": db_product.name,
             "price": db_product.price,
-            "message": f"Обновленная цена товара {db_product.id}: {db_product.price}",
-            "force_fail": False,
         }
+    )
+    await rabbit.RabbitMq.publish_event(
+        routing_key="price.updated",
+        data={
+            "product_id": db_product.id,
+            "new_price": db_product.price,
+        },
     )
     return db_product
 
