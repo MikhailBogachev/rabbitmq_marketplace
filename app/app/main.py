@@ -1,11 +1,12 @@
 from contextlib import asynccontextmanager
 import json
+from uuid import uuid4
 
 from aio_pika import Message
 from fastapi import Body, FastAPI, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import models, schemas, crud, database, rabbit
+from . import models, schemas, crud, database, rabbit, models_events
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -73,3 +74,23 @@ async def publish_unroutable():
     # Публикуем напрямую в exchange с неправильным ключом
     await rabbit.RabbitMq.exchange.publish(msg, routing_key="price.update.WRONG")
     return {"ok": True}
+
+
+@app.post("/debug/publish_duplicate_price_updated")
+async def publish_duplicate_price_updated(product_id: int = Body(1), new_price: float = Body(123.45)):
+    event_id = str(uuid4())
+
+    envelope = {
+        "event_id": event_id,
+        "event_type": "price.updated",
+        "occurred_at": "2026-04-09T00:00:00Z",
+        "producer": "catalog-service",
+        "schema_version": 1,
+        "data": {"product_id": product_id, "new_price": new_price},
+    }
+
+    # публикуем два раза ОДИН И ТОТ ЖЕ event_id
+    await rabbit.RabbitMq.publish_event("price.updated", envelope)
+    await rabbit.RabbitMq.publish_event("price.updated", envelope)
+
+    return {"published_event_id": event_id, "count": 2}
